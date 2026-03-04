@@ -3,7 +3,7 @@
 用法:
   -arm   创建 VM.Standard.A1.Flex (ARM架构)
   -amd   创建 VM.Standard.E2.1.Micro (AMD架构)
-  -c     配置文件路径 (默认: ./oci-help.ini)
+  -c     配置文件路径 (默认: ./config.ini)
 
 示例:
   ./oci -arm
@@ -33,7 +33,7 @@ import (
 
 // ── 常量 ───────────────────────────────────────────────────────────────────────
 
-const defConfigFilePath = "./oci-help.ini"
+const defConfigFilePath = "./config.ini"
 
 // ── 全局变量 ────────────────────────────────────────────────────────────────────
 
