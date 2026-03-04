@@ -510,7 +510,7 @@ func createOrGetVcn() (vcn core.Vcn, err error) {
 		return
 	}
 	fmt.Printf("VCN创建成功: %s", *cr.Vcn.DisplayName)
-	// v54 SDK: Vcn.Ipv6CidrBlock 为 *string（单数），VCN 创建后默认不含 IPv6 前缀
+	// v54 SDK 中 Vcn.Ipv6CidrBlock 为 *string（单数）
 	if cr.Vcn.Ipv6CidrBlock != nil && *cr.Vcn.Ipv6CidrBlock != "" {
 		fmt.Printf("  IPv6 CIDR: %s", *cr.Vcn.Ipv6CidrBlock)
 	}
@@ -607,7 +607,8 @@ func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
 		displayName = time.Now().Format("subnet-20060102-1504")
 	}
 
-	// 先获取 VCN 的 IPv6 前缀，用于子网分配
+	// v54 SDK: 通过 Ipv6CidrBlock (*string) 为子网分配 IPv6 /64
+	// 先获取 VCN 的 IPv6 前缀，截取前 48 位后拼上子网段构成 /64
 	vcnResp, vcnErr := networkClient.GetVcn(ctx, core.GetVcnRequest{
 		VcnId:           vcnID,
 		RequestMetadata: retryPolicy(),
@@ -619,10 +620,11 @@ func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
 		DisplayName:   common.String(displayName),
 		DnsLabel:      common.String("subnetdns"),
 	}
-	// v54 SDK: Vcn.Ipv6CidrBlock 为 *string（单数）
-	// 如果 VCN 已有 IPv6 前缀，为子网分配一个 /64（从 VCN /56 中划出 0001::/64）
+	// 如果 VCN 已分配 IPv6 前缀，为子网启用 IPv6（OCI 自动从 VCN /56 中划分 /64）
 	if vcnErr == nil && vcnResp.Vcn.Ipv6CidrBlock != nil && *vcnResp.Vcn.Ipv6CidrBlock != "" {
+		// 取 VCN /56 前缀的前 48 位，子网固定用 "0001::/64"
 		vcnPrefix := *vcnResp.Vcn.Ipv6CidrBlock
+		// 替换末尾 /56 为子网 CIDR /64（将第4段设为0001）
 		subnetIPv6 := strings.Replace(vcnPrefix, "::/56", ":1::/64", 1)
 		if subnetIPv6 != vcnPrefix {
 			subnetDetails.Ipv6CidrBlock = common.String(subnetIPv6)
@@ -665,7 +667,7 @@ func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
 	}
 
 	fmt.Printf("Subnet创建成功: %s", *cr.Subnet.DisplayName)
-	// v54 SDK: Subnet.Ipv6CidrBlock 为 *string（单数）
+	// v54 SDK 中 Subnet.Ipv6CidrBlock 为 *string（单数）
 	if cr.Subnet.Ipv6CidrBlock != nil && *cr.Subnet.Ipv6CidrBlock != "" {
 		fmt.Printf("  IPv6 CIDR: %s", *cr.Subnet.Ipv6CidrBlock)
 	}
