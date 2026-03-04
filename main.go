@@ -17,17 +17,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/oracle/oci-go-sdk/v54/common"
-	"github.com/oracle/oci-go-sdk/v54/core"
-	"github.com/oracle/oci-go-sdk/v54/identity"
+	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-go-sdk/v65/core"
+	"github.com/oracle/oci-go-sdk/v65/identity"
 	"gopkg.in/ini.v1"
 )
 
@@ -50,10 +50,9 @@ var (
 
 	proxy   string
 	token   string
-	chat_id string
+	chatID  string
 
-	sendMessageUrl string
-	editMessageUrl string
+	sendMessageURL string
 )
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────────
@@ -63,13 +62,13 @@ type Oracle struct {
 	Fingerprint  string `ini:"fingerprint"`
 	Tenancy      string `ini:"tenancy"`
 	Region       string `ini:"region"`
-	Key_file     string `ini:"key_file"`
-	Key_password string `ini:"key_password"`
+	KeyFile      string `ini:"key_file"`
+	KeyPassword  string `ini:"key_password"`
 }
 
 type Instance struct {
 	AvailabilityDomain     string  `ini:"availabilityDomain"`
-	SSH_Public_Key         string  `ini:"ssh_authorized_key"`
+	SSHPublicKey           string  `ini:"ssh_authorized_key"`
 	VcnDisplayName         string  `ini:"vcnDisplayName"`
 	SubnetDisplayName      string  `ini:"subnetDisplayName"`
 	Shape                  string  `ini:"shape"`
@@ -85,16 +84,7 @@ type Instance struct {
 	CloudInit              string  `ini:"cloud-init"`
 	MinTime                int32   `ini:"minTime"`
 	MaxTime                int32   `ini:"maxTime"`
-}
-
-type Message struct {
-	OK          bool   `json:"ok"`
-	Result      Result `json:"result"`
-	ErrorCode   int    `json:"error_code"`
-	Description string `json:"description"`
-}
-type Result struct {
-	MessageId int `json:"message_id"`
+	EnableIPv6             bool    `ini:"enableIPv6"`
 }
 
 // ── 入口 ─────────────────────────────────────────────────────────────────────────
@@ -108,99 +98,42 @@ func main() {
 	flag.Parse()
 
 	if !useARM && !useAMD {
-		fmt.Println("请指定 -arm 或 -amd 参数")
-		fmt.Println("  -arm   创建 VM.Standard.A1.Flex")
-		fmt.Println("  -amd   创建 VM.Standard.E2.1.Micro")
+		printUsage()
 		return
 	}
 
 	// 读取配置文件
 	cfg, err := ini.Load(configFilePath)
 	if err != nil {
-		fmt.Printf("\033[1;31m读取配置文件失败: %s\033[0m\n", err.Error())
+		printError("读取配置文件失败", err)
 		return
 	}
 
-	defSec := cfg.Section(ini.DefaultSection)
-	proxy = defSec.Key("proxy").Value()
-	token = defSec.Key("token").Value()
-	chat_id = defSec.Key("chat_id").Value()
-	sendMessageUrl = "https://api.telegram.org/bot" + token + "/sendMessage"
-	editMessageUrl = "https://api.telegram.org/bot" + token + "/editMessageText"
-	rand.Seed(time.Now().UnixNano())
+	// 加载全局配置
+	loadGlobalConfig(cfg)
 
 	// 找到第一个有效的甲骨文账号配置
-	var oracleSection *ini.Section
-	for _, sec := range cfg.Sections() {
-		if len(sec.ParentKeys()) == 0 {
-			user := sec.Key("user").Value()
-			fingerprint := sec.Key("fingerprint").Value()
-			tenancy := sec.Key("tenancy").Value()
-			region := sec.Key("region").Value()
-			key_file := sec.Key("key_file").Value()
-			if user != "" && fingerprint != "" && tenancy != "" && region != "" && key_file != "" {
-				oracleSection = sec
-				break
-			}
-		}
-	}
+	oracleSection := findValidOracleSection(cfg)
 	if oracleSection == nil {
-		fmt.Println("\033[1;31m未找到有效的甲骨文账号配置，请检查配置文件\033[0m")
+		printError("未找到有效的甲骨文账号配置", nil)
 		return
 	}
 
-	// 初始化 Oracle 账号
-	oracle = Oracle{}
-	if err := oracleSection.MapTo(&oracle); err != nil {
-		fmt.Printf("\033[1;31m解析账号配置失败: %s\033[0m\n", err.Error())
+	// 初始化 Oracle 客户端
+	if err := initOracleClient(oracleSection); err != nil {
+		printError("初始化 Oracle 客户端失败", err)
 		return
 	}
-	provider, err = getProvider(oracle)
-	if err != nil {
-		fmt.Printf("\033[1;31m获取 Provider 失败: %s\033[0m\n", err.Error())
-		return
-	}
-	computeClient, err = core.NewComputeClientWithConfigurationProvider(provider)
-	if err != nil {
-		fmt.Printf("\033[1;31m创建 ComputeClient 失败: %s\033[0m\n", err.Error())
-		return
-	}
-	setProxyOrNot(&computeClient.BaseClient)
-	networkClient, err = core.NewVirtualNetworkClientWithConfigurationProvider(provider)
-	if err != nil {
-		fmt.Printf("\033[1;31m创建 VirtualNetworkClient 失败: %s\033[0m\n", err.Error())
-		return
-	}
-	setProxyOrNot(&networkClient.BaseClient)
-	identityClient, err = identity.NewIdentityClientWithConfigurationProvider(provider)
-	if err != nil {
-		fmt.Printf("\033[1;31m创建 IdentityClient 失败: %s\033[0m\n", err.Error())
-		return
-	}
-	setProxyOrNot(&identityClient.BaseClient)
 
 	// 确定使用 ARM 还是 AMD 的实例配置段
-	instanceBaseSection := cfg.Section("INSTANCE")
-	var instanceSectionName string
-	if useARM {
-		instanceSectionName = "INSTANCE.ARM"
-	} else {
+	instanceSectionName := "INSTANCE.ARM"
+	if useAMD {
 		instanceSectionName = "INSTANCE.AMD"
 	}
 
-	// 合并 [INSTANCE] 和 [INSTANCE.ARM/AMD] 配置
-	instance = Instance{}
-	if err := instanceBaseSection.MapTo(&instance); err != nil {
-		fmt.Printf("\033[1;31m解析 [INSTANCE] 配置失败: %s\033[0m\n", err.Error())
-		return
-	}
-	instanceSection, err := cfg.GetSection(instanceSectionName)
-	if err != nil {
-		fmt.Printf("\033[1;31m未找到配置段 [%s]: %s\033[0m\n", instanceSectionName, err.Error())
-		return
-	}
-	if err := instanceSection.MapTo(&instance); err != nil {
-		fmt.Printf("\033[1;31m解析 [%s] 配置失败: %s\033[0m\n", instanceSectionName, err.Error())
+	// 加载实例配置
+	if err := loadInstanceConfig(cfg, instanceSectionName); err != nil {
+		printError("加载实例配置失败", err)
 		return
 	}
 
@@ -208,28 +141,133 @@ func main() {
 	fmt.Println("正在获取可用性域...")
 	ads, err := listAvailabilityDomains()
 	if err != nil {
-		fmt.Printf("\033[1;31m获取可用性域失败: %s\033[0m\n", err.Error())
+		printError("获取可用性域失败", err)
 		return
 	}
 
 	// 开始创建实例
-	fmt.Printf("\033[1;36m[%s] 账号: %s  开始创建实例...\033[0m\n", instanceSectionName, oracleSection.Name())
-	sum, num := launchInstances(ads, oracleSection.Name())
-	fmt.Printf("\033[1;36m创建完成。总数: %d  成功: %d  失败: %d\033[0m\n", sum, num, sum-num)
+	fmt.Printf("\033[1;36m[%s] 账号: %s 开始创建实例...\033[0m\n", 
+		instanceSectionName, oracleSection.Name())
+	
+	success, total := launchInstances(ads, oracleSection.Name())
+	fmt.Printf("\033[1;36m创建完成。总数: %d 成功: %d 失败: %d\033[0m\n", 
+		total, success, total-success)
+}
+
+func printUsage() {
+	fmt.Println("请指定 -arm 或 -amd 参数")
+	fmt.Println("  -arm   创建 VM.Standard.A1.Flex")
+	fmt.Println("  -amd   创建 VM.Standard.E2.1.Micro")
+}
+
+// ── 配置加载 ────────────────────────────────────────────────────────────────────
+
+func loadGlobalConfig(cfg *ini.File) {
+	defSec := cfg.Section(ini.DefaultSection)
+	proxy = defSec.Key("proxy").Value()
+	token = defSec.Key("token").Value()
+	chatID = defSec.Key("chat_id").Value()
+	sendMessageURL = "https://api.telegram.org/bot" + token + "/sendMessage"
+	rand.Seed(time.Now().UnixNano())
+}
+
+func findValidOracleSection(cfg *ini.File) *ini.Section {
+	for _, sec := range cfg.Sections() {
+		if len(sec.ParentKeys()) == 0 {
+			user := sec.Key("user").Value()
+			fingerprint := sec.Key("fingerprint").Value()
+			tenancy := sec.Key("tenancy").Value()
+			region := sec.Key("region").Value()
+			keyFile := sec.Key("key_file").Value()
+			if user != "" && fingerprint != "" && tenancy != "" && region != "" && keyFile != "" {
+				return sec
+			}
+		}
+	}
+	return nil
+}
+
+func initOracleClient(section *ini.Section) error {
+	oracle = Oracle{}
+	if err := section.MapTo(&oracle); err != nil {
+		return fmt.Errorf("解析账号配置失败: %w", err)
+	}
+
+	provider = common.NewRawConfigurationProvider(
+		oracle.Tenancy,
+		oracle.User,
+		oracle.Region,
+		oracle.Fingerprint,
+		getPrivateKey(oracle.KeyFile),
+		common.String(oracle.KeyPassword),
+	)
+
+	var err error
+	computeClient, err = core.NewComputeClientWithConfigurationProvider(provider)
+	if err != nil {
+		return fmt.Errorf("创建 ComputeClient 失败: %w", err)
+	}
+	setProxy(&computeClient.BaseClient)
+
+	networkClient, err = core.NewVirtualNetworkClientWithConfigurationProvider(provider)
+	if err != nil {
+		return fmt.Errorf("创建 VirtualNetworkClient 失败: %w", err)
+	}
+	setProxy(&networkClient.BaseClient)
+
+	identityClient, err = identity.NewIdentityClientWithConfigurationProvider(provider)
+	if err != nil {
+		return fmt.Errorf("创建 IdentityClient 失败: %w", err)
+	}
+	setProxy(&identityClient.BaseClient)
+
+	return nil
+}
+
+func getPrivateKey(path string) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+func loadInstanceConfig(cfg *ini.File, instanceSectionName string) error {
+	instance = Instance{}
+	
+	// 加载基础配置
+	baseSection, err := cfg.GetSection("INSTANCE")
+	if err == nil {
+		if err := baseSection.MapTo(&instance); err != nil {
+			return fmt.Errorf("解析 [INSTANCE] 配置失败: %w", err)
+		}
+	}
+
+	// 加载特定配置
+	instanceSection, err := cfg.GetSection(instanceSectionName)
+	if err != nil {
+		return fmt.Errorf("未找到配置段 [%s]", instanceSectionName)
+	}
+	
+	if err := instanceSection.MapTo(&instance); err != nil {
+		return fmt.Errorf("解析 [%s] 配置失败: %w", instanceSectionName, err)
+	}
+
+	return nil
 }
 
 // ── 创建实例核心逻辑 ──────────────────────────────────────────────────────────────
 
-func launchInstances(ads []identity.AvailabilityDomain, accountName string) (sum, num int32) {
+func launchInstances(ads []identity.AvailabilityDomain, accountName string) (success, total int32) {
 	adCount := int32(len(ads))
-	adName := common.String(instance.AvailabilityDomain)
-	sum = instance.Sum
-	if sum <= 0 {
-		sum = 1
+	adName := instance.AvailabilityDomain
+	total = instance.Sum
+	if total <= 0 {
+		total = 1
 	}
 
 	// 是否固定可用性域
-	adNotFixed := adName == nil || *adName == ""
+	adNotFixed := adName == ""
 	usableAds := make([]identity.AvailabilityDomain, len(ads))
 	copy(usableAds, ads)
 
@@ -238,551 +276,727 @@ func launchInstances(ads []identity.AvailabilityDomain, accountName string) (sum
 	if name == "" {
 		name = time.Now().Format("instance-20060102-1504")
 	}
-	displayName := common.String(name)
-	if sum > 1 {
-		displayName = common.String(name + "-1")
+	displayName := name
+	if total > 1 {
+		displayName = name + "-1"
 	}
-
-	// 构建创建请求
-	request := core.LaunchInstanceRequest{}
-	request.CompartmentId = common.String(oracle.Tenancy)
-	request.DisplayName = displayName
 
 	// 获取系统镜像
 	fmt.Println("正在获取系统镜像...")
 	image, err := getImage()
 	if err != nil {
-		printErr("获取系统镜像失败", err.Error())
+		printError("获取系统镜像失败", err)
 		return
 	}
-	fmt.Println("系统镜像:", *image.DisplayName)
+	fmt.Printf("系统镜像: %s\n", *image.DisplayName)
 
-	// 获取 Shape
-	var shape core.Shape
-	if strings.Contains(strings.ToLower(instance.Shape), "flex") && instance.Ocpus > 0 && instance.MemoryInGBs > 0 {
-		shape.Shape = &instance.Shape
-		shape.Ocpus = &instance.Ocpus
-		shape.MemoryInGBs = &instance.MemoryInGBs
-	} else {
-		fmt.Println("正在获取 Shape 信息...")
-		shape, err = getShape(image.Id, instance.Shape)
-		if err != nil {
-			printErr("获取 Shape 失败", err.Error())
-			return
-		}
-	}
-	request.Shape = shape.Shape
-	if strings.Contains(strings.ToLower(*shape.Shape), "flex") {
-		request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
-			Ocpus:       shape.Ocpus,
-			MemoryInGBs: shape.MemoryInGBs,
-		}
-		if instance.Burstable == "1/8" {
-			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization8
-		} else if instance.Burstable == "1/2" {
-			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization2
-		}
+	// 准备创建请求
+	request, err := prepareLaunchRequest(image, displayName)
+	if err != nil {
+		printError("准备创建请求失败", err)
+		return
 	}
 
 	// 获取子网
 	fmt.Println("正在获取子网...")
 	subnet, err := createOrGetNetworkInfrastructure()
 	if err != nil {
-		printErr("获取子网失败", err.Error())
+		printError("获取子网失败", err)
 		return
 	}
-	fmt.Println("子网:", *subnet.DisplayName)
+	fmt.Printf("子网: %s\n", *subnet.DisplayName)
 	request.CreateVnicDetails = &core.CreateVnicDetails{SubnetId: subnet.Id}
 
-	// 引导卷
-	sd := core.InstanceSourceViaImageDetails{ImageId: image.Id}
-	if instance.BootVolumeSizeInGBs > 0 {
-		sd.BootVolumeSizeInGBs = common.Int64(instance.BootVolumeSizeInGBs)
+	// 打印启动信息
+	printLaunchInfo(&image, accountName)
+
+	// 循环创建实例
+	var failTimes, runTimes, adIndex int32
+	var pos int32 = 0
+	skipRetryMap := make(map[int32]bool)
+	startTime := time.Now()
+
+	for pos < total {
+		// 选择可用性域
+		if adNotFixed && len(usableAds) > 0 {
+			adIndex = adIndex % int32(len(usableAds))
+			adName = *usableAds[adIndex].Name
+			adIndex++
+		}
+
+		runTimes++
+		logPrintf(accountName, "正在尝试创建第 %d 个实例 AD: %s 第 %d 次尝试", 
+			pos+1, adName, runTimes)
+		
+		request.AvailabilityDomain = common.String(adName)
+		createResp, err := computeClient.LaunchInstance(ctx, request)
+
+		if err == nil {
+			// 创建成功
+			success++
+			duration := formatDuration(time.Since(startTime))
+			logPrintf(accountName, "第 %d 个实例创建成功🎉 正在启动...", pos+1)
+
+			// 等待并获取 IP
+			handleSuccessInstance(&createResp.Instance, accountName, pos+1, 
+				runTimes, duration, &image, &displayName, name)
+
+			sleepRandom(instance.MinTime, instance.MaxTime)
+			displayName = fmt.Sprintf("%s-%d", name, pos+1)
+			request.DisplayName = common.String(displayName)
+			failTimes = 0
+			runTimes = 0
+			adIndex = 0
+			startTime = time.Now()
+			pos++
+		} else {
+			// 创建失败
+			skipRetry := handleFailure(err, accountName, pos+1, runTimes, 
+				&startTime, adNotFixed, &adIndex, skipRetryMap)
+
+			sleepRandom(instance.MinTime, instance.MaxTime)
+
+			// 处理重试逻辑
+			if shouldContinueRetry(adNotFixed, adIndex, adCount, failTimes, 
+				skipRetry, &usableAds, &skipRetryMap, &adCount) {
+				continue
+			}
+
+			// 增加失败次数计数
+			failTimes++
+			
+			// 判断是否应该放弃
+			shouldGiveUp := false
+			if instance.Retry == -1 {
+				// retry = -1 表示永远重试，但如果是不可重试错误则放弃
+				shouldGiveUp = skipRetry
+				if !skipRetry {
+					logPrintf(accountName, "第 %d 个实例继续重试 (retry=-1, 失败次数: %d)", pos+1, failTimes)
+				}
+			} else {
+				// 达到重试次数上限则放弃
+				shouldGiveUp = failTimes > instance.Retry || skipRetry
+			}
+			
+			if shouldGiveUp {
+				// 放弃当前实例
+				logPrintf(accountName, "第 %d 个实例放弃创建 (失败次数: %d)", pos+1, failTimes)
+				resetForNextInstance(ads, &usableAds, &adCount, &failTimes, 
+					&runTimes, &adIndex, &startTime)
+				pos++
+			} else {
+				// 继续重试
+				adIndex = 0
+				continue
+			}
+		}
 	}
-	request.SourceDetails = sd
+	return
+}
+
+func prepareLaunchRequest(image core.Image, displayName string) (core.LaunchInstanceRequest, error) {
+	request := core.LaunchInstanceRequest{}
+	request.CompartmentId = common.String(oracle.Tenancy)
+	request.DisplayName = common.String(displayName)
+
+	// 获取 Shape 配置
+	if strings.Contains(strings.ToLower(instance.Shape), "flex") && 
+		instance.Ocpus > 0 && instance.MemoryInGBs > 0 {
+		request.Shape = common.String(instance.Shape)
+		request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
+			Ocpus:       common.Float32(instance.Ocpus),
+			MemoryInGBs: common.Float32(instance.MemoryInGBs),
+		}
+		setBurstableConfig(request.ShapeConfig)
+	} else {
+		shape, err := getShape(image.Id, instance.Shape)
+		if err != nil {
+			return request, fmt.Errorf("获取 Shape 失败: %w", err)
+		}
+		request.Shape = shape.Shape
+		if shape.Ocpus != nil && shape.MemoryInGBs != nil {
+			request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
+				Ocpus:       shape.Ocpus,
+				MemoryInGBs: shape.MemoryInGBs,
+			}
+		}
+	}
+
+	// 配置引导卷
+	sourceDetails := core.InstanceSourceViaImageDetails{
+		ImageId: image.Id,
+	}
+	if instance.BootVolumeSizeInGBs > 0 {
+		sourceDetails.BootVolumeSizeInGBs = common.Int64(instance.BootVolumeSizeInGBs)
+	}
+	request.SourceDetails = sourceDetails
 	request.IsPvEncryptionInTransitEnabled = common.Bool(true)
 
-	// SSH 公钥 & cloud-init
-	metaData := map[string]string{"ssh_authorized_keys": instance.SSH_Public_Key}
+	// 配置元数据
+	metadata := map[string]string{"ssh_authorized_keys": instance.SSHPublicKey}
 	if instance.CloudInit != "" {
-		metaData["user_data"] = instance.CloudInit
+		metadata["user_data"] = instance.CloudInit
 	}
-	request.Metadata = metaData
+	request.Metadata = metadata
 
-	// 打印启动信息
+	return request, nil
+}
+
+func setBurstableConfig(config *core.LaunchInstanceShapeConfigDetails) {
+	switch instance.Burstable {
+	case "1/8":
+		config.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization8
+	case "1/2":
+		config.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization2
+	}
+}
+
+func getShape(imageID *string, shapeName string) (core.Shape, error) {
+	resp, err := computeClient.ListShapes(ctx, core.ListShapesRequest{
+		CompartmentId:   common.String(oracle.Tenancy),
+		ImageId:         imageID,
+		RequestMetadata: getRetryPolicy(),
+	})
+	if err != nil {
+		return core.Shape{}, err
+	}
+	
+	for _, shape := range resp.Items {
+		if strings.EqualFold(*shape.Shape, shapeName) {
+			return shape, nil
+		}
+	}
+	return core.Shape{}, errors.New("没有符合条件的 Shape")
+}
+
+func printLaunchInfo(image *core.Image, accountName string) {
 	bootVolumeSize := float64(instance.BootVolumeSizeInGBs)
 	if bootVolumeSize == 0 {
 		bootVolumeSize = math.Round(float64(*image.SizeInMBs) / 1024)
 	}
-	printf("\033[1;36m[%s] 开始创建 %s  OCPU: %g  内存: %g GB  引导卷: %g GB  数量: %d\033[0m\n",
-		accountName, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum)
+	
+	ocpus := instance.Ocpus
+	memory := instance.MemoryInGBs
+	if ocpus == 0 {
+		ocpus = 1
+	}
+	if memory == 0 {
+		memory = 1
+	}
+	
+	logPrintf(accountName, "开始创建 %s OCPU: %g 内存: %g GB 引导卷: %g GB 数量: %d",
+		instance.Shape, ocpus, memory, bootVolumeSize, instance.Sum)
+}
 
-	// 循环创建
-	retry := instance.Retry
-	var failTimes, runTimes, adIndex int32
-	var pos int32 = 0
-	SKIP_RETRY_MAP := make(map[int32]bool)
-	usableAdsTemp := make([]identity.AvailabilityDomain, 0)
-	startTime := time.Now()
+func handleSuccessInstance(inst *core.Instance, accountName string, pos, runTimes int32,
+	duration string, image *core.Image, displayName *string, baseName string) {
+	
+	ips, err := getInstanceIPs(inst.Id)
+	if err != nil {
+		logPrintf(accountName, "实例启动失败: %v", err)
+		text := fmt.Sprintf("第%d个实例创建成功但启动失败❌\n区域:%s\n实例:%s\n配置:%s\n尝试:%d次\n耗时:%s",
+			pos, oracle.Region, *inst.DisplayName, instance.Shape, runTimes, duration)
+		sendMessage(accountName, text)
+		return
+	}
 
-	for pos < sum {
-		// 选择可用性域
-		if adNotFixed {
-			if int(adIndex) < len(usableAds) {
-				adName = usableAds[adIndex].Name
-				adIndex++
+	ipv4Str := "无"
+	ipv6Str := "无"
+	if len(ips.IPv4) > 0 {
+		ipv4Str = strings.Join(ips.IPv4, ",")
+	}
+	if len(ips.IPv6) > 0 {
+		ipv6Str = strings.Join(ips.IPv6, ",")
+	}
+
+	logPrintf(accountName, "第 %d 个实例启动成功✅ 名称: %s IPv4: %s IPv6: %s",
+		pos, *inst.DisplayName, ipv4Str, ipv6Str)
+
+	bootVolumeSize := float64(instance.BootVolumeSizeInGBs)
+	if bootVolumeSize == 0 {
+		bootVolumeSize = math.Round(float64(*image.SizeInMBs) / 1024)
+	}
+
+	text := fmt.Sprintf("第%d个实例创建成功🎉启动成功✅\n区域:%s\n实例:%s\nIPv4:%s\nIPv6:%s\nAD:%s\n配置:%s\nOCPU:%g 内存:%gGB 引导卷:%gGB\n尝试:%d次 耗时:%s",
+		pos, oracle.Region, *inst.DisplayName, ipv4Str, ipv6Str,
+		*inst.AvailabilityDomain, instance.Shape,
+		instance.Ocpus, instance.MemoryInGBs, bootVolumeSize, runTimes, duration)
+	sendMessage(accountName, text)
+}
+
+func handleFailure(err error, accountName string, pos, runTimes int32, 
+	startTime *time.Time, adNotFixed bool, adIndex *int32, 
+	skipRetryMap map[int32]bool) bool {
+	
+	errInfo := err.Error()
+	skipRetry := false
+	
+	if serviceErr, ok := common.IsServiceError(err); ok {
+		errInfo = serviceErr.GetMessage()
+		
+		// 获取HTTP状态码和错误码
+		statusCode := serviceErr.GetHTTPStatusCode()
+		errorCode := serviceErr.GetCode()
+		
+		// 判断是否应该放弃重试
+		// 只有明确的客户端错误才放弃重试，服务限制错误应该继续重试
+		if (400 <= statusCode && statusCode <= 405) ||
+			(statusCode == 409 && !strings.EqualFold(errorCode, "IncorrectState") && 
+			 !strings.Contains(strings.ToLower(errInfo), "limit")) || // 排除限制错误
+			statusCode == 412 || statusCode == 422 ||
+			statusCode == 431 || statusCode == 501 {
+			
+			// 检查是否包含"limit"关键词，限制类错误应该重试
+			if strings.Contains(strings.ToLower(errInfo), "limit") ||
+			   strings.Contains(strings.ToLower(errInfo), "quota") ||
+			   strings.Contains(strings.ToLower(errInfo), "exceeded") {
+				// 这是限制错误，应该重试
+				skipRetry = false
+				logPrintf(accountName, "遇到服务限制(将重试): %s", errInfo)
 			} else {
-				adIndex = 0
-				if len(usableAds) > 0 {
-					adName = usableAds[0].Name
-					adIndex = 1
-				}
-			}
-		}
-
-		runTimes++
-		printf("\033[1;36m[%s] 正在尝试创建第 %d 个实例  AD: %s  第 %d 次尝试\033[0m\n",
-			accountName, pos+1, *adName, runTimes)
-		request.AvailabilityDomain = adName
-		createResp, err := computeClient.LaunchInstance(ctx, request)
-
-		if err == nil {
-			// ── 创建成功 ──
-			num++
-			duration := fmtDuration(time.Since(startTime))
-			printf("\033[1;32m[%s] 第 %d 个实例抢到了🎉 正在启动...\033[0m\n", accountName, pos+1)
-
-			// 等待并获取 IP（IPv4 + IPv6）
-			ips, ipErr := getInstanceIPs(createResp.Instance.Id)
-			if ipErr != nil {
-				printf("\033[1;31m[%s] 实例启动失败: %s\033[0m\n", accountName, ipErr.Error())
-				text := fmt.Sprintf("第%d个实例创建成功但启动失败❌\n区域:%s\n实例:%s\n配置:%s\n尝试:%d次\n耗时:%s",
-					pos+1, oracle.Region, *createResp.Instance.DisplayName, *shape.Shape, runTimes, duration)
-				sendMessage(accountName, text)
-			} else {
-				strIPv4 := strings.Join(ips.IPv4, ",")
-				strIPv6 := strings.Join(ips.IPv6, ",")
-				if strIPv4 == "" { strIPv4 = "无" }
-				if strIPv6 == "" { strIPv6 = "无" }
-				printf("\033[1;32m[%s] 第 %d 个实例启动成功✅  名称: %s  IPv4: %s  IPv6: %s\033[0m\n",
-					accountName, pos+1, *createResp.Instance.DisplayName, strIPv4, strIPv6)
-				text := fmt.Sprintf("第%d个实例抢到了🎉启动成功✅\n区域:%s\n实例:%s\nIPv4:%s\nIPv6:%s\nAD:%s\n配置:%s\nOCPU:%g 内存:%gGB 引导卷:%gGB\n尝试:%d次 耗时:%s",
-					pos+1, oracle.Region, *createResp.Instance.DisplayName, strIPv4, strIPv6,
-					*createResp.Instance.AvailabilityDomain, *shape.Shape,
-					*shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, runTimes, duration)
-				sendMessage(accountName, text)
-			}
-
-			sleepRandom(instance.MinTime, instance.MaxTime)
-			displayName = common.String(fmt.Sprintf("%s-%d", name, pos+1))
-			request.DisplayName = displayName
-			failTimes = 0
-			runTimes = 0
-			adIndex = 0
-			startTime = time.Now()
-			pos++
-
-		} else {
-			// ── 创建失败 ──
-			errInfo := err.Error()
-			skipRetry := false
-			servErr, isServErr := common.IsServiceError(err)
-			if isServErr {
-				errInfo = servErr.GetMessage()
-			}
-
-			// 判断是否可重试（4xx 客户端错误大多不可重试）
-			if isServErr && ((400 <= servErr.GetHTTPStatusCode() && servErr.GetHTTPStatusCode() <= 405) ||
-				(servErr.GetHTTPStatusCode() == 409 && !strings.EqualFold(servErr.GetCode(), "IncorrectState")) ||
-				servErr.GetHTTPStatusCode() == 412 || servErr.GetHTTPStatusCode() == 422 ||
-				servErr.GetHTTPStatusCode() == 431 || servErr.GetHTTPStatusCode() == 501) {
+				// 真正的不可重试错误
 				skipRetry = true
 				if adNotFixed {
-					SKIP_RETRY_MAP[adIndex-1] = true
+					skipRetryMap[*adIndex-1] = true
 				}
-				duration := fmtDuration(time.Since(startTime))
-				printf("\033[1;31m[%s] 第 %d 个实例创建失败❌  错误: %s\033[0m\n", accountName, pos+1, errInfo)
+				duration := formatDuration(time.Since(*startTime))
+				logPrintf(accountName, "第 %d 个实例创建失败❌ 错误: %s", pos, errInfo)
 				text := fmt.Sprintf("第%d个实例创建失败❌\n错误:%s\n区域:%s\n配置:%s\n尝试:%d次 耗时:%s",
-					pos+1, errInfo, oracle.Region, *shape.Shape, runTimes, duration)
+					pos, errInfo, oracle.Region, instance.Shape, runTimes, duration)
 				sendMessage(accountName, text)
-			} else {
-				printf("\033[1;31m[%s] 创建失败(将重试): %s\033[0m\n", accountName, errInfo)
-				if adNotFixed {
-					SKIP_RETRY_MAP[adIndex-1] = false
-				}
 			}
-
-			sleepRandom(instance.MinTime, instance.MaxTime)
-
-			// 还没遍历完所有可用性域，继续下一个
-			if adNotFixed && adIndex < adCount {
-				continue
-			}
-
-			// 已遍历完一轮，统计可重试的域并判断是否继续
-			failTimes++
+		} else {
+			logPrintf(accountName, "创建失败(将重试): %s", errInfo)
 			if adNotFixed {
-				for idx, skip := range SKIP_RETRY_MAP {
-					if !skip {
-						usableAdsTemp = append(usableAdsTemp, usableAds[idx])
-					}
-				}
-				usableAds = usableAdsTemp
-				adCount = int32(len(usableAds))
-				usableAdsTemp = nil
-				for k := range SKIP_RETRY_MAP {
-					delete(SKIP_RETRY_MAP, k)
-				}
+				skipRetryMap[*adIndex-1] = false
 			}
+		}
+	} else {
+		logPrintf(accountName, "创建失败(将重试): %s", errInfo)
+	}
+	
+	return skipRetry
+}
 
-			if (retry < 0 || failTimes <= retry) && !skipRetry && adCount > 0 {
-				adIndex = 0
-				continue
-			}
+func shouldContinueRetry(adNotFixed bool, adIndex, adCount, failTimes int32,
+	skipRetry bool, usableAds *[]identity.AvailabilityDomain,
+	skipRetryMap *map[int32]bool, adCountPtr *int32) bool {
+	
+	// 还没遍历完所有可用性域，继续下一个
+	if adNotFixed && adIndex < adCount {
+		return true
+	}
 
-			// 达到重试上限，跳过当前实例
-			printf("\033[1;31m[%s] 第 %d 个实例放弃创建\033[0m\n", accountName, pos+1)
-			// 重置
-			usableAds = ads
-			adCount = int32(len(usableAds))
-			failTimes = 0
-			runTimes = 0
-			adIndex = 0
-			startTime = time.Now()
-			pos++
+	// 已遍历完一轮，更新可用域列表
+	if adNotFixed {
+		updateUsableAds(usableAds, *skipRetryMap)
+		*adCountPtr = int32(len(*usableAds))
+		*skipRetryMap = make(map[int32]bool)
+	}
+
+	// 如果设置了永远重试（retry = -1），并且不是不可重试错误，则继续
+	if instance.Retry == -1 && !skipRetry && *adCountPtr > 0 {
+		return true
+	}
+
+	return false
+}
+
+func updateUsableAds(usableAds *[]identity.AvailabilityDomain, skipRetryMap map[int32]bool) {
+	if len(skipRetryMap) == 0 {
+		return
+	}
+	
+	newAds := make([]identity.AvailabilityDomain, 0)
+	for idx, ad := range *usableAds {
+		if !skipRetryMap[int32(idx)] {
+			newAds = append(newAds, ad)
 		}
 	}
-	return
+	*usableAds = newAds
+}
+
+func resetForNextInstance(ads []identity.AvailabilityDomain, 
+	usableAds *[]identity.AvailabilityDomain, adCount *int32,
+	failTimes, runTimes, adIndex *int32, startTime *time.Time) {
+	
+	*usableAds = make([]identity.AvailabilityDomain, len(ads))
+	copy(*usableAds, ads)
+	*adCount = int32(len(*usableAds))
+	*failTimes = 0
+	*runTimes = 0
+	*adIndex = 0
+	*startTime = time.Now()
 }
 
 // ── 网络基础设施 ──────────────────────────────────────────────────────────────────
 
-func createOrGetNetworkInfrastructure() (subnet core.Subnet, err error) {
+func createOrGetNetworkInfrastructure() (core.Subnet, error) {
 	vcn, err := createOrGetVcn()
 	if err != nil {
-		return
+		return core.Subnet{}, err
 	}
+	
 	gateway, err := createOrGetInternetGateway(vcn.Id)
 	if err != nil {
-		return
+		return core.Subnet{}, err
 	}
+	
 	_, err = createOrGetRouteTable(gateway.Id, vcn.Id)
 	if err != nil {
-		return
+		return core.Subnet{}, err
 	}
-	subnet, err = createOrGetSubnet(vcn.Id)
-	return
+	
+	return createOrGetSubnet(vcn.Id)
 }
 
-func createOrGetVcn() (vcn core.Vcn, err error) {
-	req := core.ListVcnsRequest{
+func createOrGetVcn() (core.Vcn, error) {
+	resp, err := networkClient.ListVcns(ctx, core.ListVcnsRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
-		RequestMetadata: retryPolicy(),
-	}
-	resp, err := networkClient.ListVcns(ctx, req)
+		RequestMetadata: getRetryPolicy(),
+	})
 	if err != nil {
-		return
+		return core.Vcn{}, err
 	}
+
 	displayName := instance.VcnDisplayName
 	if len(resp.Items) > 0 && displayName == "" {
 		return resp.Items[0], nil
 	}
-	for _, v := range resp.Items {
-		if *v.DisplayName == displayName {
-			return v, nil
+
+	for _, vcn := range resp.Items {
+		if *vcn.DisplayName == displayName {
+			return vcn, nil
 		}
 	}
-	// 创建新 VCN（启用 IPv6）
-	fmt.Println("开始创建VCN（启用IPv6）...")
+
+	// 创建新 VCN
+	fmt.Println("开始创建 VCN...")
 	if displayName == "" {
 		displayName = time.Now().Format("vcn-20060102-1504")
 	}
-	cr, err := networkClient.CreateVcn(ctx, core.CreateVcnRequest{
-		CreateVcnDetails: core.CreateVcnDetails{
-			CidrBlock:     common.String("10.0.0.0/16"),
-			CompartmentId: common.String(oracle.Tenancy),
-			DisplayName:   common.String(displayName),
-			DnsLabel:      common.String("vcndns"),
-		},
-		RequestMetadata: retryPolicy(),
-	})
-	if err != nil {
-		return
+
+	createDetails := core.CreateVcnDetails{
+		CidrBlocks:    []string{"10.0.0.0/16"},
+		CompartmentId: common.String(oracle.Tenancy),
+		DisplayName:   common.String(displayName),
+		DnsLabel:      common.String("vcndns"),
 	}
-	fmt.Printf("VCN创建成功: %s", *cr.Vcn.DisplayName)
-	// v54 SDK 中 Vcn.Ipv6CidrBlock 为 *string（单数）
-	if cr.Vcn.Ipv6CidrBlock != nil && *cr.Vcn.Ipv6CidrBlock != "" {
-		fmt.Printf("  IPv6 CIDR: %s", *cr.Vcn.Ipv6CidrBlock)
+
+	// 如果需要 IPv6
+	if instance.EnableIPv6 {
+		createDetails.IsIpv6Enabled = common.Bool(true)
+	}
+
+	createResp, err := networkClient.CreateVcn(ctx, core.CreateVcnRequest{
+		CreateVcnDetails: createDetails,
+		RequestMetadata:  getRetryPolicy(),
+	})
+	
+	if err != nil {
+		return core.Vcn{}, err
+	}
+
+	fmt.Printf("VCN 创建成功: %s", *createResp.Vcn.DisplayName)
+	if instance.EnableIPv6 && len(createResp.Vcn.Ipv6CidrBlocks) > 0 {
+		fmt.Printf(" IPv6 CIDR: %s", strings.Join(createResp.Vcn.Ipv6CidrBlocks, ", "))
 	}
 	fmt.Println()
-	return cr.Vcn, nil
+	
+	return createResp.Vcn, nil
 }
 
-func createOrGetInternetGateway(vcnID *string) (gw core.InternetGateway, err error) {
-	listResp, err := networkClient.ListInternetGateways(ctx, core.ListInternetGatewaysRequest{
+func createOrGetInternetGateway(vcnID *string) (core.InternetGateway, error) {
+	resp, err := networkClient.ListInternetGateways(ctx, core.ListInternetGatewaysRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
 		VcnId:           vcnID,
-		RequestMetadata: retryPolicy(),
+		RequestMetadata: getRetryPolicy(),
 	})
 	if err != nil {
-		return
+		return core.InternetGateway{}, err
 	}
-	if len(listResp.Items) >= 1 {
-		return listResp.Items[0], nil
+
+	if len(resp.Items) >= 1 {
+		return resp.Items[0], nil
 	}
-	fmt.Println("开始创建Internet网关...")
+
+	fmt.Println("开始创建 Internet 网关...")
 	enabled := true
-	cr, err := networkClient.CreateInternetGateway(ctx, core.CreateInternetGatewayRequest{
+	createResp, err := networkClient.CreateInternetGateway(ctx, core.CreateInternetGatewayRequest{
 		CreateInternetGatewayDetails: core.CreateInternetGatewayDetails{
 			CompartmentId: common.String(oracle.Tenancy),
 			IsEnabled:     &enabled,
 			VcnId:         vcnID,
+			DisplayName:   common.String("internet-gateway-" + time.Now().Format("20060102")),
 		},
-		RequestMetadata: retryPolicy(),
+		RequestMetadata: getRetryPolicy(),
 	})
+	
 	if err != nil {
-		return
+		return core.InternetGateway{}, err
 	}
-	fmt.Printf("Internet网关创建成功: %s\n", *cr.InternetGateway.DisplayName)
-	return cr.InternetGateway, nil
+
+	fmt.Printf("Internet 网关创建成功: %s\n", *createResp.InternetGateway.DisplayName)
+	return createResp.InternetGateway, nil
 }
 
-func createOrGetRouteTable(gatewayID, vcnID *string) (rt core.RouteTable, err error) {
-	listResp, err := networkClient.ListRouteTables(ctx, core.ListRouteTablesRequest{
+func createOrGetRouteTable(gatewayID, vcnID *string) (core.RouteTable, error) {
+	resp, err := networkClient.ListRouteTables(ctx, core.ListRouteTablesRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
 		VcnId:           vcnID,
-		RequestMetadata: retryPolicy(),
+		RequestMetadata: getRetryPolicy(),
 	})
 	if err != nil {
-		return
+		return core.RouteTable{}, err
 	}
+
+	if len(resp.Items) == 0 {
+		return core.RouteTable{}, errors.New("未找到路由表")
+	}
+
+	routeTable := resp.Items[0]
 	cidr := "0.0.0.0/0"
-	rr := core.RouteRule{
+	routeRule := core.RouteRule{
 		NetworkEntityId: gatewayID,
 		Destination:     &cidr,
 		DestinationType: core.RouteRuleDestinationTypeCidrBlock,
 	}
-	if len(listResp.Items) >= 1 {
-		if len(listResp.Items[0].RouteRules) >= 1 {
-			return listResp.Items[0], nil
-		}
-		fmt.Println("路由表未配置规则，添加Internet路由规则...")
-		ur, uerr := networkClient.UpdateRouteTable(ctx, core.UpdateRouteTableRequest{
-			RtId: listResp.Items[0].Id,
+
+	// 检查是否需要更新路由规则
+	if len(routeTable.RouteRules) == 0 {
+		fmt.Println("路由表未配置规则，添加 Internet 路由规则...")
+		updateResp, err := networkClient.UpdateRouteTable(ctx, core.UpdateRouteTableRequest{
+			RtId: routeTable.Id,
 			UpdateRouteTableDetails: core.UpdateRouteTableDetails{
-				RouteRules: []core.RouteRule{rr},
+				RouteRules: []core.RouteRule{routeRule},
 			},
-			RequestMetadata: retryPolicy(),
+			RequestMetadata: getRetryPolicy(),
 		})
-		if uerr != nil {
-			return rt, uerr
+		if err != nil {
+			return core.RouteTable{}, err
 		}
 		fmt.Println("路由规则添加成功")
-		return ur.RouteTable, nil
+		return updateResp.RouteTable, nil
 	}
-	return rt, errors.New("未找到默认路由表")
+
+	return routeTable, nil
 }
 
-func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
-	listResp, err := networkClient.ListSubnets(ctx, core.ListSubnetsRequest{
+func createOrGetSubnet(vcnID *string) (core.Subnet, error) {
+	resp, err := networkClient.ListSubnets(ctx, core.ListSubnetsRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
 		VcnId:           vcnID,
-		RequestMetadata: retryPolicy(),
+		RequestMetadata: getRetryPolicy(),
 	})
 	if err != nil {
-		return
+		return core.Subnet{}, err
 	}
+
 	displayName := instance.SubnetDisplayName
-	if len(listResp.Items) > 0 && displayName == "" {
-		return listResp.Items[0], nil
+	if len(resp.Items) > 0 && displayName == "" {
+		return resp.Items[0], nil
 	}
-	for _, s := range listResp.Items {
-		if *s.DisplayName == displayName {
-			return s, nil
+
+	for _, subnet := range resp.Items {
+		if *subnet.DisplayName == displayName {
+			return subnet, nil
 		}
 	}
-	// 创建子网（启用 IPv6，自动从 VCN IPv6 前缀分配 /64）
-	fmt.Println("开始创建Subnet（启用IPv6）...")
+
+	// 创建子网
+	fmt.Println("开始创建 Subnet...")
 	if displayName == "" {
 		displayName = time.Now().Format("subnet-20060102-1504")
 	}
 
-	// v54 SDK: 通过 Ipv6CidrBlock (*string) 为子网分配 IPv6 /64
-	// 先获取 VCN 的 IPv6 前缀，截取前 48 位后拼上子网段构成 /64
-	vcnResp, vcnErr := networkClient.GetVcn(ctx, core.GetVcnRequest{
-		VcnId:           vcnID,
-		RequestMetadata: retryPolicy(),
-	})
-	subnetDetails := core.CreateSubnetDetails{
+	createDetails := core.CreateSubnetDetails{
 		CompartmentId: common.String(oracle.Tenancy),
 		VcnId:         vcnID,
 		CidrBlock:     common.String("10.0.0.0/20"),
 		DisplayName:   common.String(displayName),
 		DnsLabel:      common.String("subnetdns"),
 	}
-	// 如果 VCN 已分配 IPv6 前缀，为子网启用 IPv6（OCI 自动从 VCN /56 中划分 /64）
-	if vcnErr == nil && vcnResp.Vcn.Ipv6CidrBlock != nil && *vcnResp.Vcn.Ipv6CidrBlock != "" {
-		// 取 VCN /56 前缀的前 48 位，子网固定用 "0001::/64"
-		vcnPrefix := *vcnResp.Vcn.Ipv6CidrBlock
-		// 替换末尾 /56 为子网 CIDR /64（将第4段设为0001）
-		subnetIPv6 := strings.Replace(vcnPrefix, "::/56", ":1::/64", 1)
-		if subnetIPv6 != vcnPrefix {
-			subnetDetails.Ipv6CidrBlock = common.String(subnetIPv6)
+
+	// 如果需要 IPv6
+	if instance.EnableIPv6 {
+		vcnResp, err := networkClient.GetVcn(ctx, core.GetVcnRequest{
+			VcnId:           vcnID,
+			RequestMetadata: getRetryPolicy(),
+		})
+		if err == nil && len(vcnResp.Vcn.Ipv6CidrBlocks) > 0 {
+			createDetails.Ipv6CidrBlocks = []string{}
 		}
 	}
 
-	cr, err := networkClient.CreateSubnet(ctx, core.CreateSubnetRequest{
-		CreateSubnetDetails: subnetDetails,
-		RequestMetadata:     retryPolicy(),
+	createResp, err := networkClient.CreateSubnet(ctx, core.CreateSubnetRequest{
+		CreateSubnetDetails: createDetails,
+		RequestMetadata:     getRetryPolicy(),
 	})
+	
 	if err != nil {
-		return
+		return core.Subnet{}, err
 	}
 
-	// 更新安全列表：允许所有 IPv4 和 IPv6 入站流量
+	// 更新安全列表
+	if err := updateSecurityList(createResp.Subnet.SecurityListIds); err != nil {
+		fmt.Printf("警告: 更新安全列表失败: %v\n", err)
+	}
+
+	fmt.Printf("Subnet 创建成功: %s", *createResp.Subnet.DisplayName)
+	if instance.EnableIPv6 && len(createResp.Subnet.Ipv6CidrBlocks) > 0 {
+		fmt.Printf(" IPv6 CIDR: %s", strings.Join(createResp.Subnet.Ipv6CidrBlocks, ", "))
+	}
+	fmt.Println()
+	
+	return createResp.Subnet, nil
+}
+
+func updateSecurityList(securityListIDs []string) error {
+	if len(securityListIDs) == 0 {
+		return nil
+	}
+
 	getResp, err := networkClient.GetSecurityList(ctx, core.GetSecurityListRequest{
-		SecurityListId:  common.String(cr.SecurityListIds[0]),
-		RequestMetadata: retryPolicy(),
+		SecurityListId:  common.String(securityListIDs[0]),
+		RequestMetadata: getRetryPolicy(),
 	})
-	if err == nil {
-		newRules := append(getResp.IngressSecurityRules,
-			// IPv4 全放行
-			core.IngressSecurityRule{
-				Protocol: common.String("all"),
-				Source:   common.String("0.0.0.0/0"),
-			},
-			// IPv6 全放行
+	if err != nil {
+		return err
+	}
+
+	// 构建入站规则
+	ingressRules := getResp.IngressSecurityRules
+	ingressRules = append(ingressRules,
+		core.IngressSecurityRule{
+			Protocol: common.String("all"),
+			Source:   common.String("0.0.0.0/0"),
+		},
+	)
+
+	// 如果需要 IPv6，添加 IPv6 规则
+	if instance.EnableIPv6 {
+		ingressRules = append(ingressRules,
 			core.IngressSecurityRule{
 				Protocol: common.String("all"),
 				Source:   common.String("::/0"),
 			},
 		)
-		networkClient.UpdateSecurityList(ctx, core.UpdateSecurityListRequest{
-			SecurityListId: common.String(cr.SecurityListIds[0]),
-			UpdateSecurityListDetails: core.UpdateSecurityListDetails{
-				IngressSecurityRules: newRules,
-			},
-			RequestMetadata: retryPolicy(),
-		})
 	}
 
-	fmt.Printf("Subnet创建成功: %s", *cr.Subnet.DisplayName)
-	// v54 SDK 中 Subnet.Ipv6CidrBlock 为 *string（单数）
-	if cr.Subnet.Ipv6CidrBlock != nil && *cr.Subnet.Ipv6CidrBlock != "" {
-		fmt.Printf("  IPv6 CIDR: %s", *cr.Subnet.Ipv6CidrBlock)
-	}
-	fmt.Println()
-	return cr.Subnet, nil
+	_, err = networkClient.UpdateSecurityList(ctx, core.UpdateSecurityListRequest{
+		SecurityListId: common.String(securityListIDs[0]),
+		UpdateSecurityListDetails: core.UpdateSecurityListDetails{
+			IngressSecurityRules: ingressRules,
+		},
+		RequestMetadata: getRetryPolicy(),
+	})
+
+	return err
 }
 
-// ── 镜像 & Shape ──────────────────────────────────────────────────────────────────
+// ── 镜像 ──────────────────────────────────────────────────────────────────────
 
-func getImage() (image core.Image, err error) {
+func getImage() (core.Image, error) {
 	if instance.OperatingSystem == "" || instance.OperatingSystemVersion == "" {
-		return image, errors.New("操作系统类型和版本不能为空")
+		return core.Image{}, errors.New("操作系统类型和版本不能为空")
 	}
-	r, err := computeClient.ListImages(ctx, core.ListImagesRequest{
+
+	resp, err := computeClient.ListImages(ctx, core.ListImagesRequest{
 		CompartmentId:          common.String(oracle.Tenancy),
 		OperatingSystem:        common.String(instance.OperatingSystem),
 		OperatingSystemVersion: common.String(instance.OperatingSystemVersion),
 		Shape:                  common.String(instance.Shape),
-		RequestMetadata:        retryPolicy(),
+		RequestMetadata:        getRetryPolicy(),
 	})
+	
 	if err != nil {
-		return
+		return core.Image{}, err
 	}
-	if len(r.Items) == 0 {
-		return image, fmt.Errorf("未找到 [%s %s] 的镜像", instance.OperatingSystem, instance.OperatingSystemVersion)
+	
+	if len(resp.Items) == 0 {
+		return core.Image{}, fmt.Errorf("未找到 [%s %s] 的镜像", 
+			instance.OperatingSystem, instance.OperatingSystemVersion)
 	}
-	return r.Items[0], nil
+	
+	return resp.Items[0], nil
 }
 
-func getShape(imageId *string, shapeName string) (core.Shape, error) {
-	r, err := computeClient.ListShapes(ctx, core.ListShapesRequest{
-		CompartmentId:   common.String(oracle.Tenancy),
-		ImageId:         imageId,
-		RequestMetadata: retryPolicy(),
-	})
-	if err != nil {
-		return core.Shape{}, err
-	}
-	for _, s := range r.Items {
-		if strings.EqualFold(*s.Shape, shapeName) {
-			return s, nil
-		}
-	}
-	return core.Shape{}, errors.New("没有符合条件的Shape")
-}
-
-// ── 获取实例公共 IP (IPv4 + IPv6) ─────────────────────────────────────────────────
+// ── 获取实例 IP ─────────────────────────────────────────────────────────────────
 
 type InstanceIPs struct {
 	IPv4 []string
 	IPv6 []string
 }
 
-func getInstanceIPs(instanceId *string) (InstanceIPs, error) {
+func getInstanceIPs(instanceID *string) (InstanceIPs, error) {
 	result := InstanceIPs{}
 
-	// 等待实例 Running（最多 10 分钟）
+	// 等待实例运行（最多 10 分钟）
 	for i := 0; i < 60; i++ {
 		resp, err := computeClient.GetInstance(ctx, core.GetInstanceRequest{
-			InstanceId:      instanceId,
-			RequestMetadata: retryPolicy(),
+			InstanceId:      instanceID,
+			RequestMetadata: getRetryPolicy(),
 		})
 		if err != nil {
 			return result, err
 		}
+		
 		if resp.LifecycleState == core.InstanceLifecycleStateRunning {
 			break
 		}
+		
 		if resp.LifecycleState == core.InstanceLifecycleStateTerminated ||
 			resp.LifecycleState == core.InstanceLifecycleStateTerminating {
 			return result, errors.New("实例已终止")
 		}
+		
 		time.Sleep(10 * time.Second)
 	}
 
-	// 获取 VNIC 附件列表
-	vasResp, err := computeClient.ListVnicAttachments(ctx, core.ListVnicAttachmentsRequest{
+	// 获取 VNIC 附件
+	vnicAttachments, err := computeClient.ListVnicAttachments(ctx, core.ListVnicAttachmentsRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
-		InstanceId:      instanceId,
-		RequestMetadata: retryPolicy(),
+		InstanceId:      instanceID,
+		RequestMetadata: getRetryPolicy(),
 	})
 	if err != nil {
 		return result, err
 	}
 
-	for _, va := range vasResp.Items {
-		// 获取 VNIC 基本信息（含 IPv4 PublicIp）
+	for _, attachment := range vnicAttachments.Items {
+		// 获取 VNIC 详情
 		vnicResp, err := networkClient.GetVnic(ctx, core.GetVnicRequest{
-			VnicId:          va.VnicId,
-			RequestMetadata: retryPolicy(),
+			VnicId:          attachment.VnicId,
+			RequestMetadata: getRetryPolicy(),
 		})
 		if err != nil {
 			continue
 		}
+		
 		if vnicResp.PublicIp != nil && *vnicResp.PublicIp != "" {
 			result.IPv4 = append(result.IPv4, *vnicResp.PublicIp)
 		}
 
-		// 获取该 VNIC 的 IPv6 地址列表
-		ipv6Resp, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{
-			VnicId:          va.VnicId,
-			RequestMetadata: retryPolicy(),
-		})
-		if err == nil {
-			for _, ipv6 := range ipv6Resp.Items {
-				if ipv6.IpAddress != nil && *ipv6.IpAddress != "" {
-					result.IPv6 = append(result.IPv6, *ipv6.IpAddress)
+		// 获取 IPv6 地址
+		if instance.EnableIPv6 {
+			ipv6Resp, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{
+				VnicId:          attachment.VnicId,
+				RequestMetadata: getRetryPolicy(),
+			})
+			if err == nil {
+				for _, ipv6 := range ipv6Resp.Items {
+					if ipv6.IpAddress != nil && *ipv6.IpAddress != "" {
+						result.IPv6 = append(result.IPv6, *ipv6.IpAddress)
+					}
 				}
 			}
 		}
 	}
 
 	if len(result.IPv4) == 0 && len(result.IPv6) == 0 {
-		return result, errors.New("未获取到任何公共IP")
+		return result, errors.New("未获取到任何公共 IP")
 	}
+	
 	return result, nil
 }
 
@@ -791,7 +1005,7 @@ func getInstanceIPs(instanceId *string) (InstanceIPs, error) {
 func listAvailabilityDomains() ([]identity.AvailabilityDomain, error) {
 	resp, err := identityClient.ListAvailabilityDomains(ctx, identity.ListAvailabilityDomainsRequest{
 		CompartmentId:   common.String(oracle.Tenancy),
-		RequestMetadata: retryPolicy(),
+		RequestMetadata: getRetryPolicy(),
 	})
 	return resp.Items, err
 }
@@ -799,81 +1013,98 @@ func listAvailabilityDomains() ([]identity.AvailabilityDomain, error) {
 // ── Telegram 消息 ─────────────────────────────────────────────────────────────────
 
 func sendMessage(name, text string) {
-	if token == "" || chat_id == "" {
+	if token == "" || chatID == "" {
 		return
 	}
+
 	data := url.Values{
 		"parse_mode": {"Markdown"},
-		"chat_id":    {chat_id},
+		"chat_id":    {chatID},
 		"text":       {"🔰*甲骨文通知* " + name + "\n" + text},
 	}
-	req, err := http.NewRequest(http.MethodPost, sendMessageUrl, strings.NewReader(data.Encode()))
+
+	req, err := http.NewRequest(http.MethodPost, sendMessageURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return
 	}
+	
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{}
-	if proxy != "" {
-		proxyURL, _ := url.Parse(proxy)
-		client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	
+	client := getHTTPClient()
+	_, err = client.Do(req)
+	if err != nil {
+		fmt.Printf("发送 Telegram 消息失败: %v\n", err)
 	}
-	client.Do(req)
+}
+
+func getHTTPClient() *http.Client {
+	if proxy == "" {
+		return &http.Client{Timeout: 10 * time.Second}
+	}
+	
+	proxyURL, err := url.Parse(proxy)
+	if err != nil {
+		return &http.Client{Timeout: 10 * time.Second}
+	}
+	
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────────
 
-func getProvider(o Oracle) (common.ConfigurationProvider, error) {
-	content, err := ioutil.ReadFile(o.Key_file)
-	if err != nil {
-		return nil, err
-	}
-	passphrase := common.String(o.Key_password)
-	return common.NewRawConfigurationProvider(o.Tenancy, o.User, o.Region, o.Fingerprint, string(content), passphrase), nil
-}
-
-func setProxyOrNot(client *common.BaseClient) {
+func setProxy(client *common.BaseClient) {
 	if proxy == "" {
 		return
 	}
+	
 	proxyURL, err := url.Parse(proxy)
 	if err != nil {
 		return
 	}
+	
 	client.HTTPClient = &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
 	}
 }
 
-func retryPolicy() common.RequestMetadata {
+func getRetryPolicy() common.RequestMetadata {
 	attempts := uint(3)
 	policy := common.NewRetryPolicyWithOptions(
-		common.WithConditionalOption(true, common.ReplaceWithValuesFromRetryPolicy(common.DefaultRetryPolicyWithoutEventualConsistency())),
 		common.WithMaximumNumberAttempts(attempts),
 		common.WithShouldRetryOperation(func(r common.OCIOperationResponse) bool {
-			return !(r.Error == nil && 199 < r.Response.HTTPResponse().StatusCode && r.Response.HTTPResponse().StatusCode < 300)
+			return r.Error != nil
 		}),
 	)
 	return common.RequestMetadata{RetryPolicy: &policy}
 }
 
 func sleepRandom(min, max int32) {
-	var second int32
+	var seconds int32
 	if min <= 0 || max <= 0 {
-		second = 1
+		seconds = 1
 	} else if min >= max {
-		second = max
+		seconds = max
 	} else {
-		second = rand.Int31n(max-min) + min
+		seconds = rand.Int31n(max-min) + min
 	}
-	printf("Sleep %d 秒...\n", second)
-	time.Sleep(time.Duration(second) * time.Second)
+	
+	fmt.Printf("%s Sleep %d 秒...\n", time.Now().Format("2006-01-02 15:04:05"), seconds)
+	time.Sleep(time.Duration(seconds) * time.Second)
 }
 
-func fmtDuration(d time.Duration) string {
+func formatDuration(d time.Duration) string {
 	days := int(d / (time.Hour * 24))
 	hours := int((d % (time.Hour * 24)).Hours())
 	minutes := int((d % time.Hour).Minutes())
 	seconds := int((d % time.Minute).Seconds())
+	
 	var parts []string
 	if days > 0 {
 		parts = append(parts, fmt.Sprintf("%d天", days))
@@ -887,17 +1118,23 @@ func fmtDuration(d time.Duration) string {
 	if seconds > 0 {
 		parts = append(parts, fmt.Sprintf("%d秒", seconds))
 	}
+	
 	if len(parts) == 0 {
-		return "< 1秒"
+		return "<1秒"
 	}
 	return strings.Join(parts, " ")
 }
 
-func printf(format string, a ...interface{}) {
-	fmt.Printf("%s ", time.Now().Format("2006-01-02 15:04:05"))
-	fmt.Printf(format, a...)
+func logPrintf(accountName, format string, args ...interface{}) {
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("%s \033[1;36m[%s]\033[0m %s\n", timestamp, accountName, msg)
 }
 
-func printErr(desc, detail string) {
-	fmt.Printf("\033[1;31mError: %s. %s\033[0m\n", desc, detail)
+func printError(desc string, err error) {
+	if err != nil {
+		fmt.Printf("\033[1;31mError: %s: %v\033[0m\n", desc, err)
+	} else {
+		fmt.Printf("\033[1;31mError: %s\033[0m\n", desc)
+	}
 }
