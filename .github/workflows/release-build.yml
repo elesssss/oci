@@ -37,7 +37,7 @@ jobs:
       - name: Build
         if: startsWith(github.ref, 'refs/tags/')
         env:
-          NAME: oci-help
+          NAME: oci
           BINDIR: build
         run: |
           make release -j$(nproc)
