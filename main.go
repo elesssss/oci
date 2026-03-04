@@ -499,12 +499,10 @@ func createOrGetVcn() (vcn core.Vcn, err error) {
 	}
 	cr, err := networkClient.CreateVcn(ctx, core.CreateVcnRequest{
 		CreateVcnDetails: core.CreateVcnDetails{
-			CidrBlocks:    []string{"10.0.0.0/16"},
+			CidrBlock:     common.String("10.0.0.0/16"),
 			CompartmentId: common.String(oracle.Tenancy),
 			DisplayName:   common.String(displayName),
 			DnsLabel:      common.String("vcndns"),
-			// 让 OCI 自动分配一个 /56 的 Oracle 原生 IPv6 前缀
-			IsIpv6Enabled: common.Bool(true),
 		},
 		RequestMetadata: retryPolicy(),
 	})
@@ -512,8 +510,9 @@ func createOrGetVcn() (vcn core.Vcn, err error) {
 		return
 	}
 	fmt.Printf("VCN创建成功: %s", *cr.Vcn.DisplayName)
-	if len(cr.Vcn.Ipv6CidrBlocks) > 0 {
-		fmt.Printf("  IPv6 CIDR: %s", strings.Join(cr.Vcn.Ipv6CidrBlocks, ", "))
+	// v54 SDK: Vcn.Ipv6CidrBlock 为 *string（单数），VCN 创建后默认不含 IPv6 前缀
+	if cr.Vcn.Ipv6CidrBlock != nil && *cr.Vcn.Ipv6CidrBlock != "" {
+		fmt.Printf("  IPv6 CIDR: %s", *cr.Vcn.Ipv6CidrBlock)
 	}
 	fmt.Println()
 	return cr.Vcn, nil
@@ -620,9 +619,14 @@ func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
 		DisplayName:   common.String(displayName),
 		DnsLabel:      common.String("subnetdns"),
 	}
-	// 如果 VCN 已有 IPv6 前缀，则为子网申请一个 /64
-	if vcnErr == nil && len(vcnResp.Vcn.Ipv6CidrBlocks) > 0 {
-		subnetDetails.Ipv6CidrBlocks = []string{} // 空列表触发 OCI 自动从 VCN 前缀分配 /64
+	// v54 SDK: Vcn.Ipv6CidrBlock 为 *string（单数）
+	// 如果 VCN 已有 IPv6 前缀，为子网分配一个 /64（从 VCN /56 中划出 0001::/64）
+	if vcnErr == nil && vcnResp.Vcn.Ipv6CidrBlock != nil && *vcnResp.Vcn.Ipv6CidrBlock != "" {
+		vcnPrefix := *vcnResp.Vcn.Ipv6CidrBlock
+		subnetIPv6 := strings.Replace(vcnPrefix, "::/56", ":1::/64", 1)
+		if subnetIPv6 != vcnPrefix {
+			subnetDetails.Ipv6CidrBlock = common.String(subnetIPv6)
+		}
 	}
 
 	cr, err := networkClient.CreateSubnet(ctx, core.CreateSubnetRequest{
@@ -661,8 +665,9 @@ func createOrGetSubnet(vcnID *string) (subnet core.Subnet, err error) {
 	}
 
 	fmt.Printf("Subnet创建成功: %s", *cr.Subnet.DisplayName)
-	if len(cr.Subnet.Ipv6CidrBlocks) > 0 {
-		fmt.Printf("  IPv6 CIDR: %s", strings.Join(cr.Subnet.Ipv6CidrBlocks, ", "))
+	// v54 SDK: Subnet.Ipv6CidrBlock 为 *string（单数）
+	if cr.Subnet.Ipv6CidrBlock != nil && *cr.Subnet.Ipv6CidrBlock != "" {
+		fmt.Printf("  IPv6 CIDR: %s", *cr.Subnet.Ipv6CidrBlock)
 	}
 	fmt.Println()
 	return cr.Subnet, nil
