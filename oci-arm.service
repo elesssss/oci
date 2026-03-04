@@ -1,0 +1,14 @@
+[Unit]
+Description=OCI-Instances
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/oci
+ExecStart=/opt/oci/oci -arm
+StandardOutput=append:/opt/oci/log_oci.log
+StandardError=append:/opt/oci/log_oci.log
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
