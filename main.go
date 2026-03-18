@@ -310,6 +310,21 @@ func launchInstances(ads []identity.AvailabilityDomain, accountName string) (suc
 	// 打印启动信息
 	printLaunchInfo(&image, accountName)
 
+	// 发送开始创建通知
+	{
+		ocpus := instance.Ocpus
+		memory := instance.MemoryInGBs
+		if ocpus == 0 { ocpus = 1 }
+		if memory == 0 { memory = 1 }
+		bootVolumeSize := float64(instance.BootVolumeSizeInGBs)
+		if bootVolumeSize == 0 {
+			bootVolumeSize = math.Round(float64(*image.SizeInMBs) / 1024)
+		}
+		text := fmt.Sprintf("开始抢注实例🚀\n区域:%s\n配置:%s\nOCPU:%g 内存:%gGB 引导卷:%gGB\n数量:%d",
+			oracle.Region, instance.Shape, ocpus, memory, bootVolumeSize, total)
+		sendMessage(accountName, text)
+	}
+
 	// 循环创建实例
 	var failTimes, runTimes, adIndex int32
 	var pos int32 = 0
